@@ -195,9 +195,3 @@ JetsonLLMBenchmarking/
 ├── README.md
 └── .gitignore
 ```
-
-## 相关资源
-
-- [Ollama 官方文档](https://ollama.ai/)
-- [NVIDIA Jetson 开发者中心](https://developer.nvidia.com/embedded-computing)
-- [LLM Benchmark 工具对比](https://blog.csdn.net/gitblog_00387/article/details/149038534)
