@@ -600,8 +600,8 @@ def print_prompt_format():
             "- num_predict: 生成 token 上限\n\n"
             "示例：\n"
             "[\n"
-            '  {"key":"short_qa","label":"短问答","prompt":"什么是量子计算？一句话回答。","num_predict":128},\n'
-            '  {"key":"reasoning","label":"逻辑推理","prompt":"...","num_predict":512}\n'
+            '  {"key":"short_qa","label":"短问答","prompt":"什么是量子计算？一句话回答。","num_predict":512},\n'
+            '  {"key":"reasoning","label":"逻辑推理","prompt":"...","num_predict":1024}\n'
             "]",
             title="Prompt JSON 格式",
             border_style="cyan",
