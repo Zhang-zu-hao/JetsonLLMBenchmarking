@@ -37,6 +37,17 @@ cd /home/seeed/JetsonLLMBenchmarking
 python3 -m pip install -r requirements.txt
 ```
 
+### 依赖说明（重要）
+
+- `requirements.txt` 只包含 Python 依赖（如 `requests`、`psutil`、`rich`）。
+- **Ollama 不在 `requirements.txt` 中**，因为本项目通过 HTTP API 调用本地 Ollama 服务，而不是使用 Python 的 Ollama SDK。
+- 运行前请确保系统已安装并启动 Ollama：
+
+```bash
+ollama serve
+ollama list
+```
+
 ## 快速开始（交互模式）
 
 ```bash
