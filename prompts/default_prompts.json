@@ -1,0 +1,32 @@
+[
+  {
+    "key": "short_qa",
+    "label": "短问答",
+    "prompt": "请用一句话解释什么是量子计算。",
+    "num_predict": 384
+  },
+  {
+    "key": "reasoning",
+    "label": "逻辑推理",
+    "prompt": "一个房间有三盏灯和三个开关，只能进入房间一次。如何判断每个开关对应哪盏灯？请分步骤解释。",
+    "num_predict": 768
+  },
+  {
+    "key": "code_gen",
+    "label": "代码生成",
+    "prompt": "请用 Python 实现一个快速排序，并补充 3 个单元测试样例。",
+    "num_predict": 1024
+  },
+  {
+    "key": "summarize",
+    "label": "摘要",
+    "prompt": "请将以下内容总结成 4 个要点：大型语言模型通过海量语料预训练获得语言能力，再通过指令微调与对齐提升任务表现与安全性。",
+    "num_predict": 512
+  },
+  {
+    "key": "long_gen",
+    "label": "长文生成",
+    "prompt": "请详细介绍 Jetson 平台在边缘 AI 部署中的优势、常见瓶颈与优化建议。",
+    "num_predict": 1536
+  }
+]
