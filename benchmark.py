@@ -1,546 +1,121 @@
 #!/usr/bin/env python3
 """
-Jetson LLM Benchmarking
-- 交互式选择模型（支持多分隔符）
+Jetson LLM Benchmarking - 主程序
+
+专为 NVIDIA Jetson 边缘设备打造的 LLM 推理性能基准测试工具
+
+功能特性:
+- 交互式模型选择，支持编号和模型名
+- 自动拉取缺失的 Ollama 模型
 - 支持默认/自定义 prompt JSON
-- 支持基于内存推荐 token 长度（num_predict）或用户自定义
+- 基于内存推荐 token 长度（num_predict）
+- 采集推理吞吐（tok/s）与系统指标（CPU/GPU/RAM/温度）
+- 输出 CSV + JSON 报告（JSON 包含完整回答内容）
+- 计算模型汇总指标（含 P95 延迟）
+
+使用方法:
+    交互模式：python3 benchmark.py
+    非交互模式：python3 benchmark.py --non-interactive --models qwen2.5:7b --prompt-file ./prompts/default_prompts.json
+
+GitHub: https://github.com/Zhang-zu-hao/JetsonLLMBenchmarking
 """
 
 import argparse
-import csv
-import json
-import os
-import re
-import statistics
-import subprocess
-import threading
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-import psutil
-import requests
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-from rich.table import Table
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn
+)
 
+# 导入核心模块
+from core.models import OllamaClient
+from core.monitor import TegrastatsMonitor
+from core.inference import benchmark_single, PromptCase
+from core.results import print_run_table, print_model_summary, save_outputs
+
+# 导入工具模块
+from utils.prompts import PromptManager, load_prompt_cases
+from utils.cli import (
+    get_interactive_models,
+    choose_prompt_file,
+    ask_num_predict_override,
+    print_welcome_panel,
+    parse_models_input
+)
+
+# 常量定义
 console = Console()
-OLLAMA_BASE = "http://localhost:11434"
-GITHUB_CONTACT_URL = "https://github.com/Zhang-zu-hao"
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPTS_PATH = PROJECT_DIR / "prompts" / "default_prompts.json"
 DEFAULT_OUTPUT_PREFIX = PROJECT_DIR / "results" / "jetson_llm_benchmark"
 
 
-@dataclass
-class PromptCase:
-    key: str
-    label: str
-    prompt: str
-    num_predict: int
-
-
-@dataclass
-class SystemSnapshot:
-    timestamp: float = 0.0
-    cpu_percent: List[float] = field(default_factory=list)
-    ram_used_mb: int = 0
-    ram_total_mb: int = 0
-    swap_used_mb: int = 0
-    swap_total_mb: int = 0
-    gpu_freq_percent: int = 0
-    gpu_temp: float = 0.0
-    cpu_temp: float = 0.0
-
-
-@dataclass
-class InferenceResult:
-    model: str
-    prompt_key: str
-    prompt_label: str
-    prompt_text: str
-    planned_num_predict: int
-    response_text: str = ""
-    prompt_eval_count: int = 0
-    prompt_eval_duration_ns: int = 0
-    eval_count: int = 0
-    eval_duration_ns: int = 0
-    total_duration_ns: int = 0
-    load_duration_ns: int = 0
-    prompt_tokens_per_sec: float = 0.0
-    gen_tokens_per_sec: float = 0.0
-    avg_cpu_percent: float = 0.0
-    max_cpu_percent: float = 0.0
-    avg_gpu_percent: float = 0.0
-    max_gpu_percent: float = 0.0
-    avg_ram_used_mb: float = 0.0
-    max_ram_used_mb: float = 0.0
-    avg_gpu_temp: float = 0.0
-    max_gpu_temp: float = 0.0
-    avg_cpu_temp: float = 0.0
-    max_cpu_temp: float = 0.0
-    error: str = ""
-
-
-class TegrastatsMonitor:
-    """后台采样 tegrastats；若系统无 tegrastats，将优雅降级。"""
-
-    def __init__(self, interval_ms: int = 500):
-        self.interval_ms = interval_ms
-        self._proc: Optional[subprocess.Popen] = None
-        self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self.snapshots: List[SystemSnapshot] = []
-        self.enabled = self._check_tegrastats()
-
-    @staticmethod
-    def _check_tegrastats() -> bool:
-        try:
-            proc = subprocess.run(
-                ["which", "tegrastats"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return proc.returncode == 0
-        except Exception:
-            return False
-
-    def start(self):
-        self._stop.clear()
-        self.snapshots.clear()
-        if not self.enabled:
-            return
-
-        self._proc = subprocess.Popen(
-            ["tegrastats", "--interval", str(self.interval_ms)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        self._thread = threading.Thread(target=self._reader, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> List[SystemSnapshot]:
-        self._stop.set()
-        if self._proc:
-            self._proc.terminate()
-            self._proc.wait()
-        if self._thread:
-            self._thread.join(timeout=3)
-        return list(self.snapshots)
-
-    def _reader(self):
-        while not self._stop.is_set() and self._proc and self._proc.stdout:
-            line = self._proc.stdout.readline()
-            if not line:
-                break
-            snap = self._parse_line(line.strip())
-            if snap:
-                with self._lock:
-                    self.snapshots.append(snap)
-
-    @staticmethod
-    def _parse_line(line: str) -> Optional[SystemSnapshot]:
-        s = SystemSnapshot(timestamp=time.time())
-        try:
-            ram = re.search(r"RAM (\d+)/(\d+)MB", line)
-            if ram:
-                s.ram_used_mb = int(ram.group(1))
-                s.ram_total_mb = int(ram.group(2))
-
-            swap = re.search(r"SWAP (\d+)/(\d+)MB", line)
-            if swap:
-                s.swap_used_mb = int(swap.group(1))
-                s.swap_total_mb = int(swap.group(2))
-
-            cpus = re.findall(r"(\d+)%@\d+", line)
-            if cpus:
-                s.cpu_percent = [float(c) for c in cpus]
-
-            gpu = re.search(r"GR3D_FREQ (\d+)%", line)
-            if gpu:
-                s.gpu_freq_percent = int(gpu.group(1))
-
-            gpu_temp = re.search(r"GPU@([\d.]+)C", line)
-            if gpu_temp:
-                s.gpu_temp = float(gpu_temp.group(1))
-
-            cpu_temp = re.search(r"CPU@([\d.]+)C", line)
-            if cpu_temp:
-                s.cpu_temp = float(cpu_temp.group(1))
-            return s
-        except Exception:
-            return None
-
-
-def parse_models_input(text: str) -> List[str]:
-    parts = [p.strip() for p in re.split(r"[,\s;|，、]+", text.strip()) if p.strip()]
-    return parts
-
-
-def load_prompt_cases(prompt_file: Path) -> List[PromptCase]:
-    with open(prompt_file, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    if not isinstance(raw, list):
-        raise ValueError("prompt JSON 顶层必须是数组")
-
-    cases: List[PromptCase] = []
-    for idx, item in enumerate(raw):
-        if not isinstance(item, dict):
-            raise ValueError(f"第 {idx + 1} 条 prompt 不是对象")
-        missing = [k for k in ("key", "label", "prompt") if k not in item]
-        if missing:
-            raise ValueError(f"第 {idx + 1} 条 prompt 缺少字段: {missing}")
-
-        num_predict = int(item.get("num_predict", 256))
-        cases.append(
-            PromptCase(
-                key=str(item["key"]),
-                label=str(item["label"]),
-                prompt=str(item["prompt"]),
-                num_predict=max(1, num_predict),
-            )
-        )
-    return cases
-
-
-def get_available_models() -> List[str]:
-    resp = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=10)
-    resp.raise_for_status()
-    return [m["name"] for m in resp.json().get("models", [])]
-
-
-def check_ollama_ready() -> None:
-    try:
-        requests.get(f"{OLLAMA_BASE}/api/tags", timeout=5).raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(
-            f"无法连接 Ollama ({OLLAMA_BASE})，请先启动服务：`ollama serve`。原始错误: {exc}"
-        ) from exc
-
-
-def warmup_model(model: str):
-    try:
-        requests.post(
-            f"{OLLAMA_BASE}/api/generate",
-            json={"model": model, "prompt": "hi", "stream": False, "options": {"num_predict": 1}},
-            timeout=180,
-        )
-    except Exception:
-        pass
-
-
-def recommend_num_predict() -> Tuple[int, str]:
-    vm = psutil.virtual_memory()
-    total_gb = vm.total / (1024 ** 3)
-    avail_gb = vm.available / (1024 ** 3)
-
-    if total_gb <= 8:
-        rec = 512
-    elif total_gb <= 16:
-        rec = 768
-    elif total_gb <= 32:
-        rec = 1024
-    else:
-        rec = 1536
-
-    if avail_gb < 2:
-        rec = min(rec, 384)
-    elif avail_gb < 4:
-        rec = min(rec, 512)
-
-    reason = (
-        f"内存总量约 {total_gb:.1f}GB，可用约 {avail_gb:.1f}GB，推荐 num_predict={rec}。"
-        "如设置过大，可能触发显存/内存压力导致 OOM 或推理中断。"
-    )
-    return rec, reason
-
-
-def run_inference(model: str, prompt: str, num_predict: int) -> dict:
-    resp = requests.post(
-        f"{OLLAMA_BASE}/api/generate",
-        json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"num_predict": num_predict, "temperature": 0.7},
-        },
-        timeout=900,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def benchmark_single(model: str, prompt_case: PromptCase, monitor: TegrastatsMonitor) -> InferenceResult:
-    result = InferenceResult(
-        model=model,
-        prompt_key=prompt_case.key,
-        prompt_label=prompt_case.label,
-        prompt_text=prompt_case.prompt,
-        planned_num_predict=prompt_case.num_predict,
-    )
-
-    monitor.start()
-    process_cpu_samples = []
-    process_mem_samples_mb = []
-
-    try:
-        proc = psutil.Process()
-        start_t = time.time()
-        data = run_inference(model, prompt_case.prompt, prompt_case.num_predict)
-        end_t = time.time()
-
-        # 记录一次最基础的进程指标（补充 tegrastats 不可用场景）
-        process_cpu_samples.append(proc.cpu_percent(interval=None))
-        process_mem_samples_mb.append(proc.memory_info().rss / (1024 * 1024))
-
-        result.response_text = data.get("response", "")
-        result.prompt_eval_count = data.get("prompt_eval_count", 0)
-        result.prompt_eval_duration_ns = data.get("prompt_eval_duration", 0)
-        result.eval_count = data.get("eval_count", 0)
-        result.eval_duration_ns = data.get("eval_duration", 0)
-        result.total_duration_ns = data.get("total_duration", int((end_t - start_t) * 1e9))
-        result.load_duration_ns = data.get("load_duration", 0)
-
-        if result.prompt_eval_duration_ns > 0:
-            result.prompt_tokens_per_sec = result.prompt_eval_count / (result.prompt_eval_duration_ns / 1e9)
-        if result.eval_duration_ns > 0:
-            result.gen_tokens_per_sec = result.eval_count / (result.eval_duration_ns / 1e9)
-    except Exception as exc:
-        result.error = str(exc)
-    finally:
-        snapshots = monitor.stop()
-
-    if snapshots:
-        cpu_avgs = [sum(s.cpu_percent) / len(s.cpu_percent) for s in snapshots if s.cpu_percent]
-        cpu_maxes = [max(s.cpu_percent) for s in snapshots if s.cpu_percent]
-        gpu_pcts = [s.gpu_freq_percent for s in snapshots]
-        ram_useds = [s.ram_used_mb for s in snapshots if s.ram_used_mb > 0]
-        gpu_temps = [s.gpu_temp for s in snapshots if s.gpu_temp > 0]
-        cpu_temps = [s.cpu_temp for s in snapshots if s.cpu_temp > 0]
-
-        if cpu_avgs:
-            result.avg_cpu_percent = statistics.mean(cpu_avgs)
-            result.max_cpu_percent = max(cpu_maxes)
-        if gpu_pcts:
-            result.avg_gpu_percent = statistics.mean(gpu_pcts)
-            result.max_gpu_percent = max(gpu_pcts)
-        if ram_useds:
-            result.avg_ram_used_mb = statistics.mean(ram_useds)
-            result.max_ram_used_mb = max(ram_useds)
-        if gpu_temps:
-            result.avg_gpu_temp = statistics.mean(gpu_temps)
-            result.max_gpu_temp = max(gpu_temps)
-        if cpu_temps:
-            result.avg_cpu_temp = statistics.mean(cpu_temps)
-            result.max_cpu_temp = max(cpu_temps)
-
-    if process_cpu_samples and result.avg_cpu_percent == 0:
-        result.avg_cpu_percent = statistics.mean(process_cpu_samples)
-        result.max_cpu_percent = max(process_cpu_samples)
-    if process_mem_samples_mb and result.avg_ram_used_mb == 0:
-        result.avg_ram_used_mb = statistics.mean(process_mem_samples_mb)
-        result.max_ram_used_mb = max(process_mem_samples_mb)
-
-    return result
-
-
-def print_run_table(results: List[InferenceResult]):
-    table = Table(title="逐项测试结果", show_lines=True, expand=True)
-    table.add_column("模型", style="cyan")
-    table.add_column("Prompt", style="magenta")
-    table.add_column("num_predict", justify="right")
-    table.add_column("Prompt tok/s", justify="right", style="green")
-    table.add_column("Gen tok/s", justify="right", style="green bold")
-    table.add_column("生成Tokens", justify="right")
-    table.add_column("总耗时(s)", justify="right")
-    table.add_column("GPU% avg/max", justify="right", style="yellow")
-    table.add_column("RAM MB avg/max", justify="right")
-    table.add_column("状态", style="red")
-
-    for r in results:
-        table.add_row(
-            r.model,
-            r.prompt_label,
-            str(r.planned_num_predict),
-            f"{r.prompt_tokens_per_sec:.1f}" if not r.error else "-",
-            f"{r.gen_tokens_per_sec:.1f}" if not r.error else "-",
-            str(r.eval_count) if not r.error else "-",
-            f"{r.total_duration_ns / 1e9:.2f}" if not r.error else "-",
-            f"{r.avg_gpu_percent:.0f}/{r.max_gpu_percent:.0f}" if not r.error else "-",
-            f"{r.avg_ram_used_mb:.0f}/{r.max_ram_used_mb:.0f}" if not r.error else "-",
-            "OK" if not r.error else f"ERR: {r.error[:28]}",
-        )
-    console.print(table)
-
-
-def print_model_summary(results: List[InferenceResult]):
-    grouped: Dict[str, List[InferenceResult]] = {}
-    for r in results:
-        if not r.error:
-            grouped.setdefault(r.model, []).append(r)
-
-    table = Table(title="模型汇总", show_lines=True)
-    table.add_column("模型", style="cyan")
-    table.add_column("测试数", justify="right")
-    table.add_column("平均 Gen tok/s", justify="right", style="green bold")
-    table.add_column("P95 总耗时(s)", justify="right")
-    table.add_column("平均 GPU%", justify="right", style="yellow")
-    table.add_column("平均 RAM MB", justify="right")
-
-    for model, rs in grouped.items():
-        total_seconds = sorted([r.total_duration_ns / 1e9 for r in rs])
-        p95_idx = min(len(total_seconds) - 1, int(len(total_seconds) * 0.95))
-        table.add_row(
-            model,
-            str(len(rs)),
-            f"{statistics.mean([r.gen_tokens_per_sec for r in rs]):.1f}",
-            f"{total_seconds[p95_idx]:.2f}",
-            f"{statistics.mean([r.avg_gpu_percent for r in rs]):.0f}",
-            f"{statistics.mean([r.avg_ram_used_mb for r in rs]):.0f}",
-        )
-    console.print(table)
-
-
-def save_outputs(results: List[InferenceResult], output_prefix: Path):
-    output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = output_prefix.parent / f"{output_prefix.name}_{ts}.csv"
-    json_path = output_prefix.parent / f"{output_prefix.name}_{ts}.json"
-
-    fields = [
-        "model",
-        "prompt_key",
-        "prompt_label",
-        "planned_num_predict",
-        "prompt_eval_count",
-        "eval_count",
-        "prompt_tokens_per_sec",
-        "gen_tokens_per_sec",
-        "total_duration_s",
-        "avg_cpu_percent",
-        "avg_gpu_percent",
-        "avg_ram_used_mb",
-        "avg_gpu_temp",
-        "error",
-    ]
-
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for r in results:
-            writer.writerow(
-                {
-                    "model": r.model,
-                    "prompt_key": r.prompt_key,
-                    "prompt_label": r.prompt_label,
-                    "planned_num_predict": r.planned_num_predict,
-                    "prompt_eval_count": r.prompt_eval_count,
-                    "eval_count": r.eval_count,
-                    "prompt_tokens_per_sec": round(r.prompt_tokens_per_sec, 2),
-                    "gen_tokens_per_sec": round(r.gen_tokens_per_sec, 2),
-                    "total_duration_s": round(r.total_duration_ns / 1e9, 2),
-                    "avg_cpu_percent": round(r.avg_cpu_percent, 2),
-                    "avg_gpu_percent": round(r.avg_gpu_percent, 2),
-                    "avg_ram_used_mb": round(r.avg_ram_used_mb, 2),
-                    "avg_gpu_temp": round(r.avg_gpu_temp, 2),
-                    "error": r.error,
-                }
-            )
-
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "timestamp": datetime.now().isoformat(),
-                "results": [r.__dict__ for r in results],
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-    console.print(f"[green]结果已保存:[/green] {csv_path}")
-    console.print(f"[green]结果已保存:[/green] {json_path}")
-
-
-def maybe_override_num_predict(cases: List[PromptCase], override: Optional[int]) -> List[PromptCase]:
+def maybe_override_num_predict(cases: list, override: int) -> list:
+    """
+    根据用户指定的值覆盖 Prompt 的 num_predict 配置
+    
+    Args:
+        cases: PromptCase 列表
+        override: 用户指定的 num_predict 值，None 表示不覆盖
+        
+    Returns:
+        更新后的 PromptCase 列表
+    """
     if override is None:
         return cases
-    updated: List[PromptCase] = []
+    
+    updated = []
     for c in cases:
-        updated.append(PromptCase(key=c.key, label=c.label, prompt=c.prompt, num_predict=override))
+        updated.append(
+            PromptCase(
+                key=c.key,
+                label=c.label,
+                prompt=c.prompt,
+                num_predict=override
+            )
+        )
     return updated
 
 
-def get_interactive_models(available: List[str]) -> List[str]:
-    console.print("\n[bold]本地已下载模型（Ollama）:[/bold]")
-    console.print(f"[cyan]{', '.join(available)}[/cyan]")
-    console.print("[dim]可用以下分隔符输入多个模型：空格 / 逗号 / 分号 / | / 中文逗号[/dim]")
-    for idx, m in enumerate(available, start=1):
-        console.print(f"  {idx:>2}. {m}")
-    raw = input("\n请输入要测试的模型（支持空格/逗号/分号/| 分隔，按输入顺序执行）: ").strip()
-    selected = parse_models_input(raw)
-    if not selected:
-        raise ValueError("未输入任何模型")
-    return selected
-
-
-def choose_prompt_file(interactive: bool, cli_prompt_path: Optional[str]) -> Path:
-    if cli_prompt_path:
-        return Path(cli_prompt_path).expanduser().resolve()
-    if not interactive:
-        return DEFAULT_PROMPTS_PATH
-
-    console.print("\nPrompt 文件选择：")
-    console.print("  1) 使用默认 prompts/default_prompts.json")
-    console.print("  2) 自定义 JSON 文件路径")
-    mode = input("请选择 [1/2] (默认1): ").strip() or "1"
-    if mode == "2":
-        p = input("请输入自定义 JSON 路径: ").strip()
-        if not p:
-            raise ValueError("未输入 JSON 路径")
-        return Path(p).expanduser().resolve()
-    return DEFAULT_PROMPTS_PATH
-
-
-def ask_num_predict_override(interactive: bool, cli_num_predict: Optional[int]) -> Optional[int]:
-    if cli_num_predict is not None:
-        return max(1, cli_num_predict)
-    rec, reason = recommend_num_predict()
-    console.print(f"\n[cyan]Token 长度建议：[/cyan]{reason}")
-    if not interactive:
-        return None
-
-    raw = input(
-        "请输入全局 num_predict（回车用推荐值，输入 0 按 JSON 各条配置；"
-        "可设大一点，但过大可能爆内存）: "
-    ).strip()
-    if not raw:
-        return rec
-    try:
-        val = int(raw)
-    except ValueError as exc:
-        raise ValueError("num_predict 必须是整数") from exc
-    if val == 0:
-        return None
-    if val < 0:
-        raise ValueError("num_predict 不能为负数")
-    return val
-
-
-def benchmark(models: List[str], prompts: List[PromptCase], rounds: int, warmup: bool, interval_ms: int) -> List[InferenceResult]:
+def benchmark(
+    models: list,
+    prompts: list,
+    rounds: int,
+    warmup: bool,
+    interval_ms: int
+) -> list:
+    """
+    执行完整的基准测试流程
+    
+    Args:
+        models: 模型列表
+        prompts: Prompt 列表
+        rounds: 测试轮数
+        warmup: 是否预热模型
+        interval_ms: 系统监控采样间隔（毫秒）
+        
+    Returns:
+        InferenceResult 结果列表
+    """
+    # 初始化监控器和客户端
     monitor = TegrastatsMonitor(interval_ms=interval_ms)
+    client = OllamaClient()
+    
     total_tasks = len(models) * len(prompts) * rounds
-    all_results: List[InferenceResult] = []
-
+    all_results = []
+    
+    # 检查 tegrastats 可用性
     if not monitor.enabled:
-        console.print("[yellow]提示：当前环境未检测到 tegrastats，将仅采集部分进程级指标。[/yellow]")
-
+        console.print("[yellow]提示：当前环境未检测到 tegrastats，将仅采集进程级指标。[/yellow]")
+    
+    # 进度条
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -550,20 +125,37 @@ def benchmark(models: List[str], prompts: List[PromptCase], rounds: int, warmup:
         console=console,
     ) as progress:
         task = progress.add_task("基准测试进行中", total=total_tasks)
-
+        
         for model in models:
+            # 预热模型
             if warmup:
                 progress.update(task, description=f"预热 {model}")
-                warmup_model(model)
+                client.warmup(model)
+                import time
                 time.sleep(1)
-
+            
             for round_idx in range(1, rounds + 1):
                 for p in prompts:
-                    progress.update(task, description=f"{model} · {p.label} · R{round_idx}")
-                    result = benchmark_single(model, p, monitor)
+                    progress.update(
+                        task,
+                        description=f"{model} · {p.label} · R{round_idx}"
+                    )
+                    
+                    # 执行单次测试
+                    result = benchmark_single(
+                        model=model,
+                        prompt_case=p,
+                        monitor=monitor,
+                        client=client
+                    )
+                    
                     all_results.append(result)
+                    
+                    # 实时显示结果
                     if result.error:
-                        console.print(f"  [red]✗ {model} · {p.label} | {result.error[:72]}[/red]")
+                        console.print(
+                            f"  [red]✗ {model} · {p.label} | {result.error[:72]}[/red]"
+                        )
                     else:
                         console.print(
                             f"  [green]✓[/green] {model} · {p.label}"
@@ -572,98 +164,166 @@ def benchmark(models: List[str], prompts: List[PromptCase], rounds: int, warmup:
                             f" | GPU {result.avg_gpu_percent:.0f}%"
                             f" | RAM {result.avg_ram_used_mb:.0f}MB"
                         )
+                    
                     progress.advance(task)
+    
     return all_results
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Jetson LLM Benchmarking")
-    parser.add_argument("-m", "--models", nargs="*", help="模型列表；未提供时进入交互输入")
-    parser.add_argument("-p", "--prompt-file", help="prompt JSON 文件路径")
-    parser.add_argument("--num-predict", type=int, default=None, help="全局覆盖 num_predict")
-    parser.add_argument("-r", "--rounds", type=int, default=1, help="重复轮数，默认 1")
-    parser.add_argument("--no-warmup", action="store_true", help="跳过预热")
-    parser.add_argument("--tegrastats-interval", type=int, default=500, help="tegrastats 采样间隔(ms)")
-    parser.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT_PREFIX), help="输出前缀")
-    parser.add_argument("--non-interactive", action="store_true", help="禁用交互，缺少参数则用默认值")
-    parser.add_argument("--show-prompt-format", action="store_true", help="打印默认 prompt JSON 格式示例并退出")
+    """构建命令行参数解析器"""
+    parser = argparse.ArgumentParser(
+        description="Jetson LLM Benchmarking - 专为 NVIDIA Jetson 边缘设备打造的 LLM 推理性能基准测试工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  交互模式：
+    python3 benchmark.py
+  
+  非交互模式:
+    python3 benchmark.py --non-interactive --models qwen2.5:7b llama3.1:8b --prompt-file ./prompts/default_prompts.json --num-predict 256 --rounds 1
+  
+  查看 Prompt 格式:
+    python3 benchmark.py --show-prompt-format
+        """
+    )
+    
+    parser.add_argument(
+        "-m", "--models",
+        nargs="*",
+        help="模型列表；未提供时进入交互输入"
+    )
+    parser.add_argument(
+        "-p", "--prompt-file",
+        help="prompt JSON 文件路径"
+    )
+    parser.add_argument(
+        "--num-predict",
+        type=int,
+        default=None,
+        help="全局覆盖 num_predict"
+    )
+    parser.add_argument(
+        "-r", "--rounds",
+        type=int,
+        default=1,
+        help="重复轮数，默认 1"
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="跳过预热"
+    )
+    parser.add_argument(
+        "--tegrastats-interval",
+        type=int,
+        default=500,
+        help="tegrastats 采样间隔 (ms)"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default=str(DEFAULT_OUTPUT_PREFIX),
+        help="输出文件前缀"
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="禁用交互，缺少参数则用默认值"
+    )
+    parser.add_argument(
+        "--show-prompt-format",
+        action="store_true",
+        help="打印默认 prompt JSON 格式示例并退出"
+    )
+    
     return parser
 
 
-def print_prompt_format():
-    console.print(
-        Panel.fit(
-            "默认 prompt JSON 是数组，每项包含：\n"
-            "- key: 唯一标识\n"
-            "- label: 显示名\n"
-            "- prompt: 提示词正文\n"
-            "- num_predict: 生成 token 上限\n\n"
-            "示例：\n"
-            "[\n"
-            '  {"key":"short_qa","label":"短问答","prompt":"什么是量子计算？一句话回答。","num_predict":512},\n'
-            '  {"key":"reasoning","label":"逻辑推理","prompt":"...","num_predict":1024}\n'
-            "]",
-            title="Prompt JSON 格式",
-            border_style="cyan",
-        )
-    )
-    console.print(f"默认文件路径：{DEFAULT_PROMPTS_PATH}")
-
-
 def main():
+    """主函数入口"""
     args = build_parser().parse_args()
-
+    
+    # 显示 Prompt 格式
     if args.show_prompt_format:
-        print_prompt_format()
+        prompt_manager = PromptManager(DEFAULT_PROMPTS_PATH)
+        prompt_manager.show_format()
         return
-
-    check_ollama_ready()
-
-    console.print(
-        Panel.fit(
-            "[bold cyan]Jetson LLM Benchmarking[/bold cyan]\n"
-            "[dim]交互式模型选择 · 自定义 prompts · token 推荐[/dim]\n"
-            f"[dim]遇到问题欢迎到 GitHub 反馈：{GITHUB_CONTACT_URL}[/dim]\n"
-            "[dim]欢迎一起建设这个项目[/dim]",
-            border_style="cyan",
-        )
-    )
-
-    interactive = not args.non_interactive and not args.models
-    available = get_available_models()
+    
+    # 初始化客户端并检查连接
+    client = OllamaClient()
+    client.check_connection()
+    
+    # 打印欢迎信息
+    print_welcome_panel()
+    
+    # 获取可用模型
+    available = client.get_available_models()
     if not available:
         raise RuntimeError("未检测到任何 Ollama 模型，请先 `ollama pull <model>`")
-    console.print(f"\n检测到 Ollama 模型: [cyan]{', '.join(available)}[/cyan]")
-
-    models = args.models if args.models else get_interactive_models(available)
-    missing = [m for m in models if m not in available]
-    if missing:
-        console.print(f"[yellow]以下模型本机不可用，将跳过: {missing}[/yellow]")
-    models = [m for m in models if m in available]
+    
+    console.print(f"\n检测到 Ollama 模型：[cyan]{', '.join(available)}[/cyan]")
+    
+    # 确定是否交互模式
+    interactive = not args.non_interactive and not args.models
+    
+    # 获取模型列表
+    if args.models:
+        models = args.models
+    else:
+        models = get_interactive_models(available)
+    
+    # 检查并拉取缺失的模型
+    missing_models = [m for m in models if m not in available]
+    if missing_models:
+        console.print(f"\n[yellow]发现缺失模型：{missing_models}[/yellow]")
+        console.print("[yellow]开始自动拉取...[/yellow]\n")
+        
+        for model in missing_models:
+            success = client.pull_model(model)
+            if success:
+                available.append(model)
+            else:
+                console.print(f"[red]模型 {model} 拉取失败，已跳过[/red]")
+                models.remove(model)
+    
     if not models:
         raise RuntimeError("可测试模型为空")
-
-    prompt_file = choose_prompt_file(interactive=not args.non_interactive, cli_prompt_path=args.prompt_file)
-    if not prompt_file.exists():
-        raise FileNotFoundError(f"prompt 文件不存在: {prompt_file}")
-
+    
+    # 选择 Prompt 文件
+    prompt_file = choose_prompt_file(
+        interactive=interactive,
+        cli_prompt_path=args.prompt_file
+    )
+    
+    # 加载 Prompt
     prompt_cases = load_prompt_cases(prompt_file)
-    num_predict_override = ask_num_predict_override(interactive=not args.non_interactive, cli_num_predict=args.num_predict)
+    
+    # 询问 num_predict 覆盖
+    num_predict_override = ask_num_predict_override(
+        interactive=interactive,
+        cli_num_predict=args.num_predict
+    )
+    
+    # 应用覆盖
     prompt_cases = maybe_override_num_predict(prompt_cases, num_predict_override)
-
+    
+    # 计算总任务数
     total_tasks = len(models) * len(prompt_cases) * max(1, args.rounds)
-    console.print(f"\n使用模型: [cyan]{models}[/cyan]")
-    console.print(f"Prompt 文件: [cyan]{prompt_file}[/cyan]")
-    console.print(f"Prompt 数量: [cyan]{len(prompt_cases)}[/cyan]")
-    console.print(f"轮数: [cyan]{args.rounds}[/cyan]")
+    
+    # 打印测试计划
+    console.print(f"\n使用模型：[cyan]{models}[/cyan]")
+    console.print(f"Prompt 文件：[cyan]{prompt_file}[/cyan]")
+    console.print(f"Prompt 数量：[cyan]{len(prompt_cases)}[/cyan]")
+    console.print(f"轮数：[cyan]{args.rounds}[/cyan]")
     console.print(f"Warmup: [cyan]{'否' if args.no_warmup else '是'}[/cyan]\n")
     console.print(
-        f"测试计划: [yellow]{len(models)}[/yellow] 个模型 × "
+        f"测试计划：[yellow]{len(models)}[/yellow] 个模型 × "
         f"[yellow]{len(prompt_cases)}[/yellow] 类提示词 × "
         f"[yellow]{max(1, args.rounds)}[/yellow] 轮 = "
         f"[bold yellow]{total_tasks}[/bold yellow] 次推理\n"
     )
-
+    
+    # 执行基准测试
     results = benchmark(
         models=models,
         prompts=prompt_cases,
@@ -671,11 +331,18 @@ def main():
         warmup=not args.no_warmup,
         interval_ms=max(100, args.tegrastats_interval),
     )
-
+    
+    # 打印结果表格
     print_run_table(results)
     console.print()
+    
+    # 打印模型汇总
     print_model_summary(results)
+    
+    # 保存结果
     save_outputs(results, Path(args.output))
+    
+    # 完成提示
     console.print(Panel.fit("[bold green]测试完成[/bold green]", border_style="green"))
 
 
